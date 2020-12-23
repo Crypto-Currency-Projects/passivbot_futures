@@ -16,6 +16,18 @@ from passivbot_futures import load_key_secret, calc_new_ema, print_, ts_to_date,
 import ccxt.async_support as ccxt_async
 
 
+def load_settings(user: str = 'default') -> dict:
+    fpath = 'settings/bybit/'
+    try:
+        settings = json.load(open(f'{fpath}{user}.json'))
+    except FileNotFoundError:
+        print(f'settings for user {user} not found, using default settings')
+        settings = json.load(open(f'{fpath}default.json'))
+    print('\nloaded settings:')
+    pprint.pprint(settings)
+    return settings
+
+
 def date_to_ts(date: str):
     return ciso8601.parse_datetime(date).timestamp() * 1000
 
@@ -373,8 +385,7 @@ async def main():
 
 async def start_bot(n_tries: int = 0):
     user = sys.argv[1]
-    settings = {'symbol': 'BTCUSD', 'markup': 0.00143, 'leverage': 100, 'ema_span': 38036,
-                'spread': 0.00011, 'entry_amount': 1}
+    settings = load_settings(user)
     max_n_tries = 30
     try:
         bot = await create_bot(user, settings)
