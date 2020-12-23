@@ -136,7 +136,7 @@ class Bot:
         self.ema_span = settings['ema_span']
         self.markup = settings['markup']
         self.entry_amount = settings['entry_amount']
-        self.flashcrash_factor = settings['flashcrash_factor']
+        self.spread = settings['spread']
         self.leverage = settings['leverage']
         self.enter_long = settings['enter_long']
         self.enter_shrt = settings['enter_shrt']
@@ -145,8 +145,8 @@ class Bot:
         self.cc = ccxt_async.binance({'apiKey': (ks := load_key_secret('binance', user))[0],
                                       'secret': ks[1]})
 
-        self.ts_locked = {'create_bid': 0, 'create_ask': 0, 'cancel_all_open_orders': 0,
-                          'verify_orders': 0, 'decide': 0, 'update_state': 0, 'order_taken': 0}
+        self.ts_locked = {'create_bid': 0, 'create_ask': 0, 'cancel_open_orders': 0,
+                          'verify_orders': 0, 'decide': 0, 'update_state': 0, 'print': 0}
         self.ts_released = {k: 1 for k in self.ts_locked}
 
         self.positions = {}
@@ -158,10 +158,10 @@ class Bot:
         self.price = 0
         self.ema_alpha = 2 / (self.ema_span + 1)
         self.ema_alpha_ = 1 - self.ema_alpha
-        self.bid_ema_multiplier = 1 - self.flashcrash_factor
-        self.ask_ema_multiplier = 1 + self.flashcrash_factor
-        self.bid_trigger_ema_multiplier = 1 - self.flashcrash_factor * 0.98
-        self.ask_trigger_ema_multiplier = 1 + self.flashcrash_factor * 0.98
+        self.bid_ema_multiplier = 1 - self.spread
+        self.ask_ema_multiplier = 1 + self.spread
+        self.bid_trigger_ema_multiplier = 1 - self.spread * 0.98
+        self.ask_trigger_ema_multiplier = 1 + self.spread * 0.98
 
         self.exit_price = 0.0
         self.double_down_price = 0.0
@@ -296,9 +296,9 @@ class Bot:
         return o
 
     async def cancel_open_orders(self, orders_to_cancel: [dict]) -> [dict]:
-        if self.ts_locked['cancel_all_open_orders'] > self.ts_released['cancel_all_open_orders']:
+        if self.ts_locked['cancel_open_orders'] > self.ts_released['cancel_open_orders']:
             return
-        self.ts_locked['cancel_all_open_orders'] = time()
+        self.ts_locked['cancel_open_orders'] = time()
         deletions = []
         for oc in orders_to_cancel:
             try:
@@ -320,7 +320,7 @@ class Bot:
                 print(e)
                 continue
         await self.update_open_orders()
-        self.ts_released['cancel_all_open_orders'] = time()
+        self.ts_released['cancel_open_orders'] = time()
         return canceled_orders
 
     async def init_ema(self) -> None:
@@ -339,14 +339,6 @@ class Bot:
 
     def stop(self) -> None:
         self.stop_websocket = True
-
-    def flush_stuck_locks(self, timeout: float = 4.0) -> None:
-        now = time()
-        for key in self.ts_locked:
-            if self.ts_locked[key] > self.ts_released[key]:
-                if now - self.ts_locked[key] > timeout:
-                    print('flushing', key)
-                    self.ts_released[key] = now
 
     def calc_exit_double_down(self) -> [dict]:
         try:
@@ -388,28 +380,24 @@ class Bot:
             print()
         return results
 
-    def check_if_order_taken(self):
-        if self.price <= self.highest_bid:
-            self.ts_released['order_taken'] = time()
-            print_(['bid maybe taken'], n=True)
-        elif self.price >= self.lowest_ask:
-            self.ts_released['order_taken'] = time()
-            print_(['ask maybe taken'], n=True)
-
     async def decide(self) -> None:
-        self.check_if_order_taken()
-        if 0 < self.ts_locked['decide'] - self.ts_released['decide'] < 2.0:
+        if self.price <= self.highest_bid:
+            self.ts_locked['decide'] = time()
+            print_(['bid maybe taken'], n=True)
+            await self.update_state()
+            await self.create_exits()
+            self.ts_released['decide'] = time()
             return
-        self.ts_locked['decide'] = time()
-        self.flush_stuck_locks()
-        if time() - self.ts_released['order_taken'] < 2.0:
-            await asyncio.sleep(0.1)
+        elif self.price >= self.lowest_ask:
+            self.ts_locked['decide'] = time()
+            print_(['ask maybe taken'], n=True)
             await self.update_state()
             await self.create_exits()
             self.ts_released['decide'] = time()
             return
         elif self.symbol not in self.positions:
             if self.enter_long and self.price <= self.ema * self.bid_trigger_ema_multiplier:
+                self.ts_locked['decide'] = time()
                 await self.create_bid(self.symbol,
                                       self.entry_amount,
                                       round_dn(self.ema * self.bid_ema_multiplier,
@@ -420,6 +408,7 @@ class Bot:
                 self.ts_released['decide'] = time()
                 return
             elif self.enter_shrt and self.price >= self.ema * self.ask_trigger_ema_multiplier:
+                self.ts_locked['decide'] = time()
                 await self.create_ask(self.symbol,
                                       self.entry_amount,
                                       round_up(self.ema * self.ask_ema_multiplier,
@@ -429,26 +418,39 @@ class Bot:
                 await self.create_exits()
                 self.ts_released['decide'] = time()
                 return
-        if time() - self.ts_released['verify_orders'] > 1:
-            self.ts_released['verify_orders'] = time()
+        if time() - self.ts_released['decide'] > 5:
+            self.ts_locked['decide'] = time()
+            await self.update_state()
             await self.create_exits()
-            if time() - self.ts_released['update_state'] > 5:
-                await self.update_state()
+            self.ts_released['decide'] = time()
+            return
+        if time() - self.ts_released['print'] > 1:
+            self.ts_released['print'] = time()
             line = f"{self.symbol} "
             if self.symbol in self.positions:
                 if self.positions[self.symbol]['positionAmt'] > 0.0:
                     line += f"long {self.positions[self.symbol]['positionAmt']} @ "
+                    try:
+                        r = (self.price - self.double_down_price) / \
+                            (self.exit_price - self.double_down_price)
+                    except ZeroDivisionError:
+                        r = 0.5
                 else:
                     line += f"shrt {abs(self.positions[self.symbol]['positionAmt'])} @ "
+                    try:
+                        r = 1 - (self.price - self.exit_price) / \
+                            (self.double_down_price - self.exit_price)
+                    except ZeroDivisionError:
+                        r = 0.5
                 line += f"{self.positions[self.symbol]['entryPrice']} "
                 line += f"exit {self.exit_price} ddown {self.double_down_price} "
+                line += f"pct {r:.2f} "
             else:
                 line += f'no pos '
                 line += f"bid {self.ema * self.bid_ema_multiplier:.{self.price_precision}f} "
                 line += f"ask {self.ema * self.ask_ema_multiplier:.{self.price_precision}f} "
             line += f'last {self.price:.{self.price_precision}f} '
             print_([line], r=True)
-        self.ts_released['decide'] = time()
 
     async def start_websocket(self) -> None:
         self.stop_websocket = False
@@ -472,7 +474,10 @@ class Bot:
                                         n_steps=agg_id - self.agg_id)
                 self.agg_id = agg_id
                 self.price = price
-                await self.decide()
+                if self.ts_locked['decide'] < self.ts_released['decide']:
+                    asyncio.create_task(self.decide())
+                elif self.agg_id % 10 == 0:
+                    self.flush_stuck_locks()
                 if self.stop_websocket:
                     break
 
@@ -599,11 +604,21 @@ class Bot:
                  'maker': mt['maker'],
                  'buyer': mt['maker']} for mt in my_trades]
 
+    def flush_stuck_locks(self, timeout: float = 4.0) -> None:
+        now = time()
+        for key in self.ts_locked:
+            if self.ts_locked[key] > self.ts_released[key]:
+                if now - self.ts_locked[key] > timeout:
+                    print('flushing', key)
+                    self.ts_released[key] = now
+
 
 def backtest(adf: pd.DataFrame,
              settings: dict,
-             margin_cost_limit: float = 0.0) -> ([dict], [dict], pd.DataFrame):
-    flashcrash_factor = settings['flashcrash_factor']
+             margin_cost_limit: float = 0.0,
+             maker_fee: float = 0.00018,
+             taker_fee: float = 0.00036) -> ([dict], [dict], pd.DataFrame):
+    spread = settings['spread']
     ema_span = settings['ema_span']
     markup = settings['markup']
     leverage = settings['leverage']
@@ -613,10 +628,8 @@ def backtest(adf: pd.DataFrame,
 
     assert enter_long or enter_shrt
 
-    threshold_plus = 1 + flashcrash_factor
-    threshold_minus = 1 - flashcrash_factor
-    maker_fee = round(0.018 * 0.01, 8)
-    taker_fee = round(0.036 * 0.01, 8)
+    threshold_plus = 1 + spread
+    threshold_minus = 1 - spread
     roe = markup * leverage
 
     liq_multiplier = (1 / leverage) / 2
@@ -630,11 +643,12 @@ def backtest(adf: pd.DataFrame,
     margin_cost_max = 0
     margin_cost = 0.0
     realized_pnl_sum = 0.0
+    n_double_downs = 0
 
     trades = []
 
-    bid_name = f'entry_bid_{ema_span}_{flashcrash_factor * 1000}'.replace('.', '_')
-    ask_name = f'entry_ask_{ema_span}_{flashcrash_factor * 1000}'.replace('.', '_')
+    bid_name = f'entry_bid_{ema_span}_{spread * 1000}'.replace('.', '_')
+    ask_name = f'entry_ask_{ema_span}_{spread * 1000}'.replace('.', '_')
 
     if bid_name not in adf.columns:
         print('calculating entry prices...')
@@ -664,7 +678,7 @@ def backtest(adf: pd.DataFrame,
                                'agg_id': row.Index, 'price': row.price, 'amount': entry_amount,
                                'margin_cost': cost / leverage, 'realized_pnl': 0.0,
                                'fee': cost * taker_fee,
-                               'n_double_downs': int(round(np.log2(pos_amount / entry_amount)))})
+                               'n_double_downs': -1})
                 do_print = True
             elif enter_shrt and getattr(row, 'price') >= getattr(row, ask_name):
                 pos_amount = -entry_amount
@@ -677,7 +691,7 @@ def backtest(adf: pd.DataFrame,
                                'agg_id': row.Index, 'price': row.price, 'amount': -entry_amount,
                                'margin_cost': cost / leverage, 'realized_pnl': 0.0,
                                'fee': cost * taker_fee,
-                               'n_double_downs': int(round(np.log2(-pos_amount / entry_amount)))})
+                               'n_double_downs': -1})
                 do_print = True
         elif pos_amount > 0.0:
             # long position
@@ -689,19 +703,20 @@ def backtest(adf: pd.DataFrame,
                                'agg_id': row.Index, 'price': exit_price, 'amount': pos_amount,
                                'margin_cost': cost / leverage, 'realized_pnl': realized_pnl,
                                'fee': cost * maker_fee,
-                               'n_double_downs': int(round(np.log2(pos_amount / entry_amount)))})
+                               'n_double_downs': -1})
                 do_print = True
-                (pos_amount, entry_price, liq_price, exit_price,
-                 double_down_price) = 0.0, 0.0, 0.0, 0.0, 0.0
+                pos_amount, entry_price, liq_price, exit_price, double_down_price, n_double_downs = \
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0
             elif row.price <= double_down_price:
+                n_double_downs += 1
                 cost = pos_amount * double_down_price
                 trades.append({'timestamp': row.timestamp, 'side': 'buy', 'type': 'entry',
                                'agg_id': row.Index, 'price': double_down_price,
                                'amount': pos_amount, 'margin_cost': cost / leverage,
                                'realized_pnl': 0.0, 'fee': cost * maker_fee,
-                               'n_double_downs': int(round(np.log2(pos_amount / entry_amount)))})
-                pos_amount *= 2
+                               'n_double_downs': n_double_downs})
                 entry_price = (entry_price + double_down_price) / 2
+                pos_amount *= 2
                 liq_price = entry_price * (1 - liq_multiplier)
                 exit_price = entry_price * (1 + markup)
                 double_down_price = liq_price
@@ -716,19 +731,20 @@ def backtest(adf: pd.DataFrame,
                                'agg_id': row.Index, 'price': exit_price, 'amount': pos_amount,
                                'margin_cost': margin_cost, 'realized_pnl': realized_pnl,
                                'fee': cost * maker_fee,
-                               'n_double_downs': int(round(np.log2(-pos_amount / entry_amount)))})
+                               'n_double_downs': -1})
                 do_print = True
-                (pos_amount, entry_price, liq_price, exit_price,
-                 double_down_price) = 0.0, 0.0, 0.0, 0.0, 0.0
+                pos_amount, entry_price, liq_price, exit_price, double_down_price, n_double_downs = \
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0
             elif row.price >= double_down_price:
+                n_double_downs += 1
                 cost = -pos_amount * double_down_price
                 trades.append({'timestamp': row.timestamp, 'side': 'sel', 'type': 'entry',
                                'agg_id': row.Index, 'price': double_down_price,
                                'amount': pos_amount, 'margin_cost': cost / leverage,
                                'realized_pnl': 0.0, 'fee': cost * maker_fee,
-                               'n_double_downs': int(round(np.log2(-pos_amount / entry_amount)))})
-                pos_amount *= 2
+                               'n_double_downs': n_double_downs})
                 entry_price = (entry_price + double_down_price) / 2
+                pos_amount *= 2
                 liq_price = entry_price * (1 + liq_multiplier)
                 exit_price = entry_price * (1 - markup)
                 double_down_price = liq_price
@@ -754,7 +770,7 @@ async def main() -> None:
 async def start_bot(n_tries: int = 0) -> None:
     user = sys.argv[1]
     settings = load_settings(user)
-    max_n_tries = 15
+    max_n_tries = 30
     try:
         bot = await create_bot(user, settings)
         await bot.start_websocket()
@@ -766,7 +782,7 @@ async def start_bot(n_tries: int = 0) -> None:
         if n_tries >= max_n_tries:
             return
         n_tries += 1
-        for k in range(15, -1, -1):
+        for k in range(10, -1, -1):
             sys.stdout.write(f'\rrestarting bot in {k} seconds   ')
             sleep(1)
         await start_bot(n_tries + 1)
