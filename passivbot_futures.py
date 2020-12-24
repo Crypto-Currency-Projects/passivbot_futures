@@ -630,7 +630,6 @@ def backtest(adf: pd.DataFrame,
 
     threshold_plus = 1 + spread
     threshold_minus = 1 - spread
-    roe = markup * leverage
 
     liq_multiplier = (1 / leverage) / 2
 
@@ -697,8 +696,7 @@ def backtest(adf: pd.DataFrame,
             # long position
             if row.price >= exit_price:
                 cost = pos_amount * exit_price
-                margin_cost = cost / leverage
-                realized_pnl = margin_cost * roe
+                realized_pnl = cost * markup
                 trades.append({'timestamp': row.timestamp, 'side': 'sel', 'type': 'exit',
                                'agg_id': row.Index, 'price': exit_price, 'amount': pos_amount,
                                'margin_cost': cost / leverage, 'realized_pnl': realized_pnl,
@@ -725,11 +723,10 @@ def backtest(adf: pd.DataFrame,
             # shrt position
             if row.price <= exit_price:
                 cost = -pos_amount * exit_price
-                margin_cost = cost / leverage
-                realized_pnl = margin_cost * roe
+                realized_pnl = cost * markup
                 trades.append({'timestamp': row.timestamp, 'side': 'buy', 'type': 'exit',
                                'agg_id': row.Index, 'price': exit_price, 'amount': pos_amount,
-                               'margin_cost': margin_cost, 'realized_pnl': realized_pnl,
+                               'margin_cost': cost / leverage, 'realized_pnl': realized_pnl,
                                'fee': cost * maker_fee,
                                'n_double_downs': -1})
                 do_print = True
