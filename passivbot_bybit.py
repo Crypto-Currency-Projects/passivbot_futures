@@ -267,23 +267,27 @@ class Bot:
             return
         elif self.position['size'] == 0:
             if self.price <= self.ema * self.ema_bid_trigger_multiplier:
-                price = round_dn(min(self.ema, self.price) * self.spread_minus, self.price_step)
+                price = min(self.price, round_dn(self.ema * self.spread_minus, self.price_step))
                 if self.highest_bid != price:
                     self.ts_locked['decide'] = time()
-                    await self.create_bid(self.entry_amount, price)
+                    await asyncio.gather(self.cancel_orders(self.open_orders),
+                                         self.create_bid(self.entry_amount, price))
                     await asyncio.sleep(1.0)
                     await self.update_state()
-                    await self.create_exits()
+                    if self.position['size'] != 0:
+                        await self.create_exits()
                     self.ts_released['decide'] = time()
                     return
             elif self.price >= self.ema * self.ema_ask_trigger_multiplier:
-                price = round_up(max(self.ema, self.price) * self.spread_plus, self.price_step)
+                price = max(self.price, round_up(self.ema * self.spread_plus, self.price_step))
                 if self.lowest_ask != price:
                     self.ts_locked['decide'] = time()
-                    await self.create_ask(self.entry_amount, price)
+                    await asyncio.gather(self.cancel_orders(self.open_orders),
+                                         self.create_ask(self.entry_amount, price))
                     await asyncio.sleep(1.0)
                     await self.update_state()
-                    await self.create_exits()
+                    if self.position['size'] != 0:
+                        await self.create_exits()
                     self.ts_released['decide'] = time()
                     return
         if time() - self.ts_locked['decide'] > 5:
