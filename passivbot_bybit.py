@@ -231,6 +231,61 @@ class Bot:
                 ts_to_date(trades[0]['timestamp'] / 1000)])
         return trades
 
+    def calc_orders(self):
+        if self.position['size'] == 0:
+            bid_price = round_dn(self.ema * self.spread_minus, self.price_step)
+            ask_price = round_up(self.ema * self.spread_plus, self.price_step)
+            bid_diff = self.price / bid_price
+            ask_diff = ask_price / self.price
+            orders = []
+            if bid_diff < 1.00007:
+                orders.append({'symbol': self.symbol, 'side': 'Buy', 'qty': self.entry_amount,
+                               'price': bid_price})
+            if ask_diff < 1.00007:
+                orders.append({'symbol': self.symbol, 'side': 'Sell', 'qty': self.entry_amount,
+                               'price': ask_price})
+            return orders
+        else:
+            if self.position['side'] == 'Buy':
+                # long position
+                bid_price = round_up(max(
+                    self.position['entry_price'] * (1 - (1 / self.position['leverage']) / 2),
+                    self.position['liq_price'] + 0.00001
+                ), self.price_step)
+                ask_price = round_up(self.position['entry_price'] * (1 + self.markup),
+                                     self.price_step)
+            else:
+                # shrt position
+                ask_price = round_dn(min(
+                    self.position['entry_price'] * (1 + (1 / self.position['leverage']) / 2),
+                    self.position['liq_price'] - 0.00001
+                ), self.price_step)
+                bid_price = round_dn(self.position['entry_price'] * (1 - self.markup),
+                                     self.price_step)
+            return [{'symbol': self.symbol, 'side': 'Buy', 'qty': self.position['size'],
+                     'price': bid_price},
+                     {'symbol': self.symbol, 'side': 'Sell', 'qty': self.position['size'],
+                     'price': ask_price}]
+
+    async def create_orders(self):
+        to_cancel, to_create = filter_orders(self.open_orders,
+                                             self.calc_orders(),
+                                             keys=['side', 'qty', 'price'])
+        tasks = []
+        if to_cancel:
+            tasks.append(self.cancel_orders(to_cancel))
+        for o in to_create:
+            if o['side'] == 'Buy':
+                tasks.append(self.create_bid(o['qty'], o['price']))
+            elif o['side'] == 'Sell':
+                tasks.append(self.create_ask(o['qty'], o['price']))
+        results = await asyncio.gather(*tasks)
+        await asyncio.sleep(0.1)
+        await self.update_state()
+        if results:
+            print()
+        return results
+
     async def create_exits(self) -> list:
         to_cancel, to_create = filter_orders(self.open_orders,
                                              self.calc_exit_double_down(),
@@ -250,7 +305,67 @@ class Bot:
             print()
         return results
 
+
     async def decide(self):
+        if self.price <= self.highest_bid:
+            self.ts_locked['decide'] = time()
+            print_(['bid maybe taken'], n=True)
+            await self.update_state()
+            await self.create_orders()
+            self.ts_released['decide'] = time()
+            return
+        if self.price >= self.lowest_ask:
+            self.ts_locked['decide'] = time()
+            print_(['ask maybe taken'], n=True)
+            await self.update_state()
+            await self.create_orders()
+            self.ts_released['decide'] = time()
+            return
+        if time() - self.ts_locked['decide'] > 5:
+            self.ts_locked['decide'] = time()
+            await self.update_state()
+            await self.create_orders()
+            self.ts_released['decide'] = time()
+            return
+        if time() - self.ts_released['print'] >= 0.5:
+            self.ts_released['print'] = time()
+            line = f"{self.symbol} "
+            if self.position['size'] == 0:
+                bid_price = round_dn(self.ema * self.spread_minus, self.price_step)
+                ask_price = round_up(self.ema * self.spread_plus, self.price_step)
+                line += f"no position bid {bid_price} ask {ask_price} "
+                r = 0.0
+            elif self.position['side'] == 'Buy':
+                line += f"long {self.position['size']} @ {self.position['entry_price']:.2f} "
+                ddn_price, exit_price = 0.0, 0.0
+                for o in self.open_orders:
+                    if o['side'] == 'Buy':
+                        ddn_price = o['price']
+                    elif o['side'] == 'Sell':
+                        exit_price = o['price']
+                line += f"exit {exit_price} ddown {ddn_price} "
+                try:
+                    r = (self.price - ddn_price) / (exit_price - ddn_price)
+                except ZeroDivisionError:
+                    r = 0.5
+            elif self.position['side'] == 'Sell':
+                line += f"shrt {self.position['size']} @ {self.position['entry_price']:.2f} "
+                ddn_price, exit_price = 0.0, 0.0
+                for o in self.open_orders:
+                    if o['side'] == 'Sell':
+                        ddn_price = o['price']
+                    elif o['side'] == 'Buy':
+                        exit_price = o['price']
+                try:
+                    r = 1 - (self.price - exit_price) / (ddn_price - exit_price)
+                except ZeroDivisionError:
+                    r = 0.5
+                line += f"exit {exit_price} ddown {ddn_price} "
+
+            line += f"pct {r:.2f} last {self.price}   "
+            print_([line], r=True)
+
+    async def decide_old(self):
         if self.price <= self.highest_bid:
             self.ts_locked['decide'] = time()
             print_(['bid maybe taken'])
@@ -267,7 +382,8 @@ class Bot:
             return
         elif self.position['size'] == 0:
             if self.price <= self.ema * self.ema_bid_trigger_multiplier:
-                price = min(self.price, round_dn(self.ema * self.spread_minus, self.price_step))
+                price = min(round_up(self.price + 0.00001, self.price_step),
+                            round_dn(self.ema * self.spread_minus, self.price_step))
                 if self.highest_bid != price:
                     self.ts_locked['decide'] = time()
                     await asyncio.gather(self.cancel_orders(self.open_orders),
@@ -279,7 +395,8 @@ class Bot:
                     self.ts_released['decide'] = time()
                     return
             elif self.price >= self.ema * self.ema_ask_trigger_multiplier:
-                price = max(self.price, round_up(self.ema * self.spread_plus, self.price_step))
+                price = max(round_dn(self.price - 0.00001, self.price_step), 
+                            round_up(self.ema * self.spread_plus, self.price_step))
                 if self.lowest_ask != price:
                     self.ts_locked['decide'] = time()
                     await asyncio.gather(self.cancel_orders(self.open_orders),
@@ -340,9 +457,12 @@ class Bot:
         print_([uri])
         await self.update_state()
         if self.position['leverage'] != self.leverage:
-            print(await self.cc.user_post_leverage_save(
-                params={'symbol': self.symbol, 'leverage': 0}
-            ))
+            try:
+                print(await self.cc.user_post_leverage_save(
+                    params={'symbol': self.symbol, 'leverage': 0}
+                ))
+            except Exception as e:
+                print(e)
         await self.init_ema()
         param = {'op': 'subscribe', 'args': ['trade.' + self.symbol]}
         k = 1
